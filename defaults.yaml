@@ -1,0 +1,5 @@
+build:
+  build-base: log/build
+  install-base: log/install
+log:
+  base: log/build
