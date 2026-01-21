@@ -10,20 +10,7 @@ def generate_launch_description():
     spawn_y_arg = DeclareLaunchArgument("spawn_y", default_value="1.0")
     spawn_theta_arg = DeclareLaunchArgument("spawn_theta", default_value="3.14")
 
-    # 1. SLAM ノード (最初に起動)
-    slam_node = Node(
-        package="slam_lite",
-        executable="slam_node",
-        name="slam_lite_node",
-        output="screen",
-        parameters=[
-            {"map_size": 20.0},
-            {"resolution": 0.05},
-            {"scan_topic": "/scan"},
-        ],
-    )
-
-    # 2. 軌跡ロガーノード
+    # 1. 軌跡ロガーノード
     logger_node = Node(
         package="wall_follow",
         executable="logger_node.py",
@@ -38,7 +25,7 @@ def generate_launch_description():
         ],
     )
 
-    # 3. 走行ノード (Wall Follow)
+    # 2. 走行ノード (Wall Follow)
     wall_follow_node = Node(
         package="wall_follow",
         executable="wall_follow_node",
@@ -51,7 +38,7 @@ def generate_launch_description():
         ],
     )
 
-    # 4. リセット管理ノード (Sim Reset)
+    # 3. リセット管理ノード (Sim Reset)
     sim_reset_node = Node(
         package="wall_follow",
         executable="sim_reset_node",
@@ -72,10 +59,9 @@ def generate_launch_description():
             spawn_x_arg,
             spawn_y_arg,
             spawn_theta_arg,
-            slam_node,        # 1. SLAM
-            logger_node,      # 2. ログ記録
-            wall_follow_node, # 3. 車を動かす
-            sim_reset_node,   # 4. リセット管理
+            logger_node,      # 1. ログ記録
+            wall_follow_node, # 2. 車を動かす
+            sim_reset_node,   # 3. リセット管理
         ]
     )
 

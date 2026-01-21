@@ -231,21 +231,11 @@ class TrajectoryLogger(Node):
         run_dir_name = f"{now_str}_{reason}"
         run_dir = os.path.join(self.log_dir, run_dir_name)
         
-        # サブディレクトリ作成
+        # サブディレクトリ作成 (simulation は不要なので削除)
         images_dir = os.path.join(run_dir, "images")
-        simulation_dir = os.path.join(run_dir, "simulation")
         mickey_dir = os.path.join(run_dir, "mickey")
         os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(simulation_dir, exist_ok=True)
         os.makedirs(mickey_dir, exist_ok=True)
-
-        # 1. simulation/simulation_position.csv 保存
-        csv_path = os.path.join(simulation_dir, "simulation_position.csv")
-        with open(csv_path, "w") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time", "rear_x", "rear_y", "front_x", "front_y", "speed"])
-            writer.writerows(self.history)
-        self.get_logger().info(f"Saved: {csv_path}")
 
         # 2. mickey/ミッキーデータ生成 (500Hz想定)
         try:
@@ -303,9 +293,9 @@ class TrajectoryLogger(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to generate image: {e}")
 
-        # 4. mickey/mickey_lidar_segments.csv 生成
+        # 4. mickey/mickey_lidar_segments.csv 生成 + images/可視化
         try:
-            self.generate_lidar_segments_mickey(mickey_dir)
+            self.generate_lidar_segments_mickey(mickey_dir, images_dir)
         except Exception as e:
             self.get_logger().error(f"Failed to generate mickey-based segments: {e}")
 
@@ -476,7 +466,7 @@ class TrajectoryLogger(Node):
             writer.writerows(kinematics_data)
         self.get_logger().info(f"Saved Vehicle Kinematics: {kinematics_path}")
 
-    def generate_lidar_segments_mickey(self, run_dir):
+    def generate_lidar_segments_mickey(self, mickey_dir, images_dir):
         """ミッキーデータに基づいてLIDARスキャンから線分を抽出
         
         mickey_kinematics.csvの移動距離とステアリング角度を使って
@@ -567,12 +557,55 @@ class TrajectoryLogger(Node):
                     all_segments.append([start[0], start[1], end[0], end[1], length, angle])
         
         # CSVに保存
-        segments_path = os.path.join(run_dir, "mickey_lidar_segments.csv")
+        segments_path = os.path.join(mickey_dir, "mickey_lidar_segments.csv")
         with open(segments_path, "w") as f:
             writer = csv.writer(f)
             writer.writerow(["start_x", "start_y", "end_x", "end_y", "length", "angle"])
             writer.writerows(all_segments)
         self.get_logger().info(f"Saved Mickey-based Segments: {segments_path} ({len(all_segments)} segments)")
+        
+        # PNG可視化を生成
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # GUIなしで動作させる
+            import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
+            
+            fig, ax = plt.subplots(figsize=(12, 12))
+            
+            # 線分データをプロット用に変換
+            if all_segments:
+                lines = [[(seg[0], seg[1]), (seg[2], seg[3])] for seg in all_segments]
+                lc = LineCollection(lines, colors='blue', linewidths=1.5, alpha=0.8)
+                ax.add_collection(lc)
+                
+                # 軸範囲を計算
+                all_x = [seg[0] for seg in all_segments] + [seg[2] for seg in all_segments]
+                all_y = [seg[1] for seg in all_segments] + [seg[3] for seg in all_segments]
+                margin = 2.0
+                ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
+                ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+            
+            ax.set_aspect('equal')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            ax.set_title(f"Mickey LIDAR Segments Map\n{len(all_segments)} segments")
+            ax.set_xlabel("X [m]")
+            ax.set_ylabel("Y [m]")
+            
+            # 車体のスタート位置をマーク (self.history[0] = 最初のオドメトリ位置)
+            if len(self.history) > 0:
+                start_x = self.history[0][1]  # rear_x
+                start_y = self.history[0][2]  # rear_y
+                ax.plot(start_x, start_y, 'go', markersize=10, label='Start Position')
+            ax.legend()
+            
+            # 保存
+            png_path = os.path.join(images_dir, "mickey_lidar_segments.png")
+            plt.savefig(png_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            self.get_logger().info(f"Saved Segments Visualization: {png_path}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to generate segments PNG: {e}")
 
 
 # グローバル変数（シグナルハンドラ用）
