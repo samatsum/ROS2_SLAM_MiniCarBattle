@@ -133,37 +133,44 @@ class TrajectoryLogger(Node):
             self.get_logger().error(f"Failed to load map settings: {e}")
 
     def odom_callback(self, msg):
+        # 最初のオドメトリを受け取った瞬間に初期位置を記録
+        if self.current_pose is None and len(self.history) == 0:
+            px = msg.pose.pose.position.x
+            py = msg.pose.pose.position.y
+            q = msg.pose.pose.orientation
+            _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
+            
+            rx, ry = px, py
+            fx = px + self.wheelbase * math.cos(yaw)
+            fy = py + self.wheelbase * math.sin(yaw)
+            
+            timestamp = self.get_clock().now().nanoseconds / 1e9
+            self.history.append([timestamp, rx, ry, fx, fy, 0.0])  # 速度0（静止）
+            self.get_logger().info(f"Initial position recorded: ({rx:.3f}, {ry:.3f})")
+        
         self.current_pose = msg
 
     def timer_callback(self):
         if self.current_pose is None:
             return
 
-        # 座標計算
         px = self.current_pose.pose.pose.position.x
         py = self.current_pose.pose.pose.position.y
 
-        # クォータニオン -> ヨー角
         q = self.current_pose.pose.pose.orientation
         _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
 
-        # リア(後輪) = base_link位置 (f1tenthの仕様)
         rx, ry = px, py
-
-        # フロント(前輪) = base_link + wheelbase * 回転
         fx = px + self.wheelbase * math.cos(yaw)
         fy = py + self.wheelbase * math.sin(yaw)
 
-        # 速度計算 (linear velocity の絶対値)
         vx = self.current_pose.twist.twist.linear.x
         vy = self.current_pose.twist.twist.linear.y
         speed = math.sqrt(vx * vx + vy * vy)
 
-        # 記録
         timestamp = self.get_clock().now().nanoseconds / 1e9
         self.history.append([timestamp, rx, ry, fx, fy, speed])
 
-        # Rviz可視化 (最新の100点だけ表示して軽量化)
         self.publish_markers()
 
     def publish_markers(self):
@@ -237,11 +244,19 @@ class TrajectoryLogger(Node):
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(mickey_dir, exist_ok=True)
 
-        # 2. mickey/ミッキーデータ生成 (500Hz想定)
+        # 2. mickey/ミッキーデータ生成 (500Hz想定、ローカル座標系)
+        front_mickey = []
+        rear_mickey = []
+        mickey_per_meter = 1000
         try:
-            self.generate_mickey_data(mickey_dir)
+            front_mickey, rear_mickey = self.generate_mickey_data(mickey_dir)
         except Exception as e:
             self.get_logger().error(f"Failed to generate mickey data: {e}")
+
+        # DR経路計算（ミッキーデータから）
+        dr_path = []
+        if front_mickey and rear_mickey:
+            dr_path = self.calculate_dead_reckoning_path(front_mickey, rear_mickey, mickey_per_meter)
 
         # 3. images/trajectory_map.png 画像生成
         try:
@@ -249,7 +264,6 @@ class TrajectoryLogger(Node):
             if not map_path:
                 self.get_logger().warn("Map path not yet fetched from gym_bridge. Skipping image generation.")
             elif os.path.exists(map_path):
-                # YAMLファイルから読み込んだ設定を使用
                 res = self.map_settings["resolution"]
                 org_x = self.map_settings["origin_x"]
                 org_y = self.map_settings["origin_y"]
@@ -258,7 +272,6 @@ class TrajectoryLogger(Node):
                 draw = ImageDraw.Draw(img)
                 width, height = img.size
 
-                # 座標変換関数 (Map -> Pixel)
                 def to_pix(mx, my):
                     px = (mx - org_x) / res
                     py = height - ((my - org_y) / res)
@@ -274,6 +287,7 @@ class TrajectoryLogger(Node):
                     draw.line([f1, f2], fill=(255, 0, 0), width=2)
 
                 # 開始点を緑で描画
+                px_pos, py_pos = 0, 0
                 if len(self.history) > 0:
                     pt = self.history[0]
                     center_x = (pt[1] + pt[3]) / 2.0
@@ -288,37 +302,197 @@ class TrajectoryLogger(Node):
                 png_path = os.path.join(images_dir, "trajectory_map.png")
                 img.save(png_path)
                 self.get_logger().info(f"Saved: {png_path}")
+                
+                # 4. images/kinematics.png 生成（DR経路の可視化）
+                if dr_path:
+                    img_kin = Image.open(map_path).convert("RGB")
+                    draw_kin = ImageDraw.Draw(img_kin)
+                    
+                    # オドメトリ軌跡を描画（薄い色）
+                    for i in range(len(self.history) - 1):
+                        r1 = to_pix(self.history[i][1], self.history[i][2])
+                        r2 = to_pix(self.history[i + 1][1], self.history[i + 1][2])
+                        draw_kin.line([r1, r2], fill=(150, 150, 255), width=1)
+                        f1 = to_pix(self.history[i][3], self.history[i][4])
+                        f2 = to_pix(self.history[i + 1][3], self.history[i + 1][4])
+                        draw_kin.line([f1, f2], fill=(255, 150, 150), width=1)
+                    
+                    # DR経路を描画（シアン色）
+                    step = max(1, len(dr_path) // 5000)
+                    for i in range(0, len(dr_path) - step, step):
+                        p1 = dr_path[i]
+                        p2 = dr_path[min(i + step, len(dr_path) - 1)]
+                        px1, py1 = to_pix(p1[1], p1[2])
+                        px2, py2 = to_pix(p2[1], p2[2])
+                        draw_kin.line([(px1, py1), (px2, py2)], fill=(0, 255, 255), width=3)
+                    
+                    # 開始点（緑）と終了点（マゼンタ）
+                    if len(self.history) > 0:
+                        draw_kin.ellipse([px_pos - 12, py_pos - 12, px_pos + 12, py_pos + 12], fill=(0, 255, 0), outline=(0, 180, 0))
+                    if dr_path:
+                        end_px, end_py = to_pix(dr_path[-1][1], dr_path[-1][2])
+                        draw_kin.ellipse([end_px - 10, end_py - 10, end_px + 10, end_py + 10], fill=(255, 0, 255), outline=(180, 0, 180))
+                    
+                    kin_path = os.path.join(images_dir, "kinematics.png")
+                    img_kin.save(kin_path)
+                    self.get_logger().info(f"Saved: {kin_path}")
             else:
                 self.get_logger().error(f"Map file not found: {map_path}")
         except Exception as e:
             self.get_logger().error(f"Failed to generate image: {e}")
 
-        # 4. mickey/mickey_lidar_segments.csv 生成 + images/可視化
+        # 5. images/mickey_lidar_points.png 生成（DR経路を使用）
         try:
-            self.generate_lidar_segments_mickey(mickey_dir, images_dir)
+            if dr_path:
+                self.generate_lidar_points_from_dr(images_dir, dr_path)
+            else:
+                self.get_logger().warn("Skipping LIDAR points generation due to missing DR path")
         except Exception as e:
-            self.get_logger().error(f"Failed to generate mickey-based segments: {e}")
+            self.get_logger().error(f"Failed to generate LIDAR points: {e}")
 
         # 履歴クリア
         self.history = []
         self.scan_history = []
+    
+    def calculate_dead_reckoning_path(self, front_mickey, rear_mickey, mickey_per_meter):
+        """純粋なDead Reckoning：前後輪の相対位置から向きを計算
+        
+        ユーザーの図解に基づく：
+        - 前輪と後輪のTotal位置から、車体の向き θ = atan2(front - rear) を計算
+        - 後輪の位置 = 初期位置 + 累積変位
+        - 車体向き = 前輪位置 - 後輪位置 の角度
+        """
+        if len(front_mickey) != len(rear_mickey) or len(rear_mickey) < 2:
+            return []
+
+        # 初期位置（オドメトリから）
+        if len(self.history) > 0:
+            rx0, ry0 = self.history[0][1], self.history[0][2]
+            fx0, fy0 = self.history[0][3], self.history[0][4] # 前輪初期位置も取得
+        else:
+            rx0, ry0 = 0.0, 0.0
+            fx0, fy0 = self.wheelbase, 0.0 # デフォルト
+
+        dr_path = []
+
+        for i in range(len(rear_mickey)):
+            timestamp = rear_mickey[i][0]
+            
+            # 前輪と後輪の累積変位（ワールド座標系、mm単位）
+            front_total_x = front_mickey[i][3] / mickey_per_meter  # meters
+            front_total_y = front_mickey[i][4] / mickey_per_meter
+            rear_total_x = rear_mickey[i][3] / mickey_per_meter
+            rear_total_y = rear_mickey[i][4] / mickey_per_meter
+            
+            # 現在位置（初期位置 + 累積変位）
+            # 注意: ここでのtotal_x/yは「ワールド座標系での累積移動量」
+            current_x = rx0 + rear_total_x
+            current_y = ry0 + rear_total_y
+            
+            # 前輪の現在位置
+            front_x = fx0 + front_total_x # rx0ではなくfx0を使用
+            front_y = fy0 + front_total_y
+            
+            # 車体の向き = 後輪から前輪への方向
+            dx = front_x - current_x
+            dy = front_y - current_y
+            
+            if abs(dx) > 0.0001 or abs(dy) > 0.0001:
+                current_theta = math.atan2(dy, dx)
+            else:
+                current_theta = math.atan2(fy0 - ry0, fx0 - rx0) if len(self.history) > 0 else 0.0
+            
+            dr_path.append([timestamp, current_x, current_y, current_theta])
+
+        return dr_path
+    
+    def generate_lidar_points_from_dr(self, images_dir, dr_path):
+        """DR経路を使ってLIDAR点群を生成・可視化"""
+        if len(self.scan_history) < 2 or not dr_path:
+            self.get_logger().warn("Not enough data for LIDAR points")
+            return
+        
+        all_points = []
+        start_time = self.history[0][0] if self.history else 0
+        
+        for scan_entry in self.scan_history:
+            scan_time, ranges, angle_min, angle_max, angle_inc = scan_entry
+            
+            # 最も近い時刻のポーズを見つける
+            closest_pose = None
+            min_diff = float('inf')
+            for pose in dr_path:
+                diff = abs(pose[0] - (scan_time - start_time))
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_pose = pose
+            
+            if closest_pose is None:
+                continue
+            
+            _, x, y, theta = closest_pose
+            
+            # LiDARの取り付けオフセット (base_link aka Rear Axle からの距離)
+            lidar_offset = 0.275
+            sensor_x = x + lidar_offset * math.cos(theta)
+            sensor_y = y + lidar_offset * math.sin(theta)
+            
+            for i, r in enumerate(ranges):
+                if r < 0.1 or r > 10.0 or math.isnan(r) or math.isinf(r):
+                    continue
+                
+                angle = angle_min + i * angle_inc
+                # センサー位置を基準に座標変換
+                wx = sensor_x + r * math.cos(theta + angle)
+                wy = sensor_y + r * math.sin(theta + angle)
+                all_points.append((wx, wy))
+        
+        if not all_points:
+            self.get_logger().warn("No valid LIDAR points generated")
+            return
+        
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        sample_step = max(1, len(all_points) // 50000)
+        sampled = all_points[::sample_step]
+        xs = [p[0] for p in sampled]
+        ys = [p[1] for p in sampled]
+        
+        ax.scatter(xs, ys, s=0.5, alpha=0.5, c='blue')
+        if dr_path:
+            ax.scatter([dr_path[0][1]], [dr_path[0][2]], c='green', s=100, marker='o', label='Start')
+        
+        ax.set_xlabel('X [m]')
+        ax.set_ylabel('Y [m]')
+        ax.set_title(f'LIDAR Points ({len(all_points)} points)')
+        ax.set_aspect('equal')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        png_path = os.path.join(images_dir, "mickey_lidar_points.png")
+        plt.savefig(png_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        self.get_logger().info(f"Saved: {png_path}")
 
     def generate_mickey_data(self, run_dir):
         """車体の前輪・後輪を2つのマウスとして扱い、ミッキーデータを生成する
         
         500Hz (2msごと) でサンプリングしたデータを生成。
+        
+        ワールド座標系での変位を記録：
+        - X: ワールドX方向の変位
+        - Y: ワールドY方向の変位
         """
         if len(self.history) < 2:
             self.get_logger().warn("Not enough data to generate mickey data")
-            return
+            return [], []
         
-        # 開始時刻を0にオフセット
         start_time = self.history[0][0]
         
-        # 線形補間で500Hzにリサンプリング
         def interpolate_position(t, history, idx_x, idx_y):
-            """時刻tにおける位置を線形補間で取得"""
-            # 該当区間を探す
             for i in range(len(history) - 1):
                 t0 = history[i][0] - start_time
                 t1 = history[i + 1][0] - start_time
@@ -329,140 +503,173 @@ class TrajectoryLogger(Node):
                     x = history[i][idx_x] + ratio * (history[i + 1][idx_x] - history[i][idx_x])
                     y = history[i][idx_y] + ratio * (history[i + 1][idx_y] - history[i][idx_y])
                     return x, y
-            # 範囲外の場合は最後の値
             return history[-1][idx_x], history[-1][idx_y]
         
-        # 総時間を計算
         end_time = self.history[-1][0] - start_time
-        dt = 0.002  # 500Hz = 2ms
+        dt = 0.002  # 500Hz
+        mickey_per_meter = 1000
         
-        # ミッキーデータ生成（DPIを仮に1000と仮定: 1m = 1000 mickey / 0.0254 = 約39370 mickey）
-        # 簡略化: 1mm = 1 mickey (DPI依存だが、理解しやすい値として設定)
-        mickey_per_meter = 1000  # 1m = 1000 mickey (1mm = 1 mickey)
-        
-        # 前輪ミッキーデータ
+        # 前輪ミッキーデータ（ワールド座標系）
         front_mickey = []
         prev_fx, prev_fy = interpolate_position(0, self.history, 3, 4)
-        total_fx, total_fy = 0, 0
+        # float値で累積（精度を保持）
+        total_fx_float, total_fy_float = 0.0, 0.0
         
         t = 0.0
         while t <= end_time:
             fx, fy = interpolate_position(t, self.history, 3, 4)
-            rel_x = int((fx - prev_fx) * mickey_per_meter)
-            rel_y = int((fy - prev_fy) * mickey_per_meter)
-            total_fx += rel_x
-            total_fy += rel_y
+            
+            dx_world = fx - prev_fx
+            dy_world = fy - prev_fy
+            
+            # float値で累積してから、int変換
+            rel_x_float = dx_world * mickey_per_meter
+            rel_y_float = dy_world * mickey_per_meter
+            total_fx_float += rel_x_float
+            total_fy_float += rel_y_float
+            
+            # 出力用にint変換
+            rel_x = int(round(rel_x_float))
+            rel_y = int(round(rel_y_float))
+            total_fx = int(round(total_fx_float))
+            total_fy = int(round(total_fy_float))
+            
             front_mickey.append([round(t, 4), rel_x, rel_y, total_fx, total_fy])
             prev_fx, prev_fy = fx, fy
             t += dt
         
-        # 後輪ミッキーデータ
+        # 後輪ミッキーデータ（ワールド座標系）
         rear_mickey = []
         prev_rx, prev_ry = interpolate_position(0, self.history, 1, 2)
-        total_rx, total_ry = 0, 0
+        # float値で累積（精度を保持）
+        total_rx_float, total_ry_float = 0.0, 0.0
         
         t = 0.0
         while t <= end_time:
             rx, ry = interpolate_position(t, self.history, 1, 2)
-            rel_x = int((rx - prev_rx) * mickey_per_meter)
-            rel_y = int((ry - prev_ry) * mickey_per_meter)
-            total_rx += rel_x
-            total_ry += rel_y
+            
+            dx_world = rx - prev_rx
+            dy_world = ry - prev_ry
+            
+            # float値で累積してから、int変換
+            rel_x_float = dx_world * mickey_per_meter
+            rel_y_float = dy_world * mickey_per_meter
+            total_rx_float += rel_x_float
+            total_ry_float += rel_y_float
+            
+            # 出力用にint変換
+            rel_x = int(round(rel_x_float))
+            rel_y = int(round(rel_y_float))
+            total_rx = int(round(total_rx_float))
+            total_ry = int(round(total_ry_float))
+            
             rear_mickey.append([round(t, 4), rel_x, rel_y, total_rx, total_ry])
             prev_rx, prev_ry = rx, ry
             t += dt
         
-        # 前輪ミッキーデータをCSVに保存
+        # CSVに保存
         front_mickey_path = os.path.join(run_dir, "mickey_front.csv")
         with open(front_mickey_path, "w") as f:
             writer = csv.writer(f)
             writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y"])
             writer.writerows(front_mickey)
-        self.get_logger().info(f"Saved Front Mickey Data: {front_mickey_path}")
+        self.get_logger().info(f"Saved Front Mickey Data (World): {front_mickey_path}")
         
-        # 後輪ミッキーデータをCSVに保存
         rear_mickey_path = os.path.join(run_dir, "mickey_rear.csv")
         with open(rear_mickey_path, "w") as f:
             writer = csv.writer(f)
             writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y"])
             writer.writerows(rear_mickey)
-        self.get_logger().info(f"Saved Rear Mickey Data: {rear_mickey_path}")
+        self.get_logger().info(f"Saved Rear Mickey Data (World): {rear_mickey_path}")
         
-        # 3. 車体キネマティクス計算 (移動距離・ステアリング角度)
         self.calculate_vehicle_kinematics(run_dir, front_mickey, rear_mickey, mickey_per_meter)
+        
+        return front_mickey, rear_mickey
 
     def calculate_vehicle_kinematics(self, run_dir, front_mickey, rear_mickey, mickey_per_meter):
-        """前輪・後輪のミッキーデータから車体の移動距離とステアリング角度を計算
+        """前輪・後輪のミッキーデータから車体の移動距離と回転角度を計算
         
-        移動距離: 後輪の移動量（車体中心基準）
-        ステアリング角度: 前後輪の移動量差からアッカーマンステアリングの式で計算
-        
-        アッカーマンステアリング: tan(steering_angle) = wheelbase / turning_radius
-        前後輪の移動差と角速度から推定
+        ユーザーのアイデアに基づく計算:
+        - 後輪と前輪の累積位置（Total_X, Total_Y）から車体の向きθを計算
+        - θ = atan2(front_Y - rear_Y, front_X - rear_X)
+        - Rotation_deg = 現在のθ - 初期のθ
         """
         if len(front_mickey) != len(rear_mickey):
             self.get_logger().error("Front and rear mickey data length mismatch")
             return
         
+        # 初期の車体向き（オドメトリから取得）
+        if len(self.history) > 0:
+            rx0, ry0 = self.history[0][1], self.history[0][2]
+            fx0, fy0 = self.history[0][3], self.history[0][4]
+            initial_theta = math.atan2(fy0 - ry0, fx0 - rx0)
+        else:
+            rx0, ry0 = 0.0, 0.0
+            fx0, fy0 = self.wheelbase, 0.0
+            initial_theta = 0.0
+        
         kinematics_data = []
         total_distance = 0.0
-        wheelbase_mickey = self.wheelbase * mickey_per_meter  # ホイールベース（ミッキー単位）
         
         for i in range(len(front_mickey)):
             timestamp = front_mickey[i][0]
             
-            # 各輪の相対移動量（ミッキー）
-            front_rel_x = front_mickey[i][1]
-            front_rel_y = front_mickey[i][2]
-            rear_rel_x = rear_mickey[i][1]
-            rear_rel_y = rear_mickey[i][2]
+            # 前輪・後輪の累積位置（初期位置 + ミッキー累積変位）
+            front_total_x = fx0 + front_mickey[i][3] / mickey_per_meter
+            front_total_y = fy0 + front_mickey[i][4] / mickey_per_meter
+            rear_total_x = rx0 + rear_mickey[i][3] / mickey_per_meter
+            rear_total_y = ry0 + rear_mickey[i][4] / mickey_per_meter
             
-            # 各輪の移動距離（ミッキー）
-            front_dist = math.sqrt(front_rel_x**2 + front_rel_y**2)
-            rear_dist = math.sqrt(rear_rel_x**2 + rear_rel_y**2)
+            # 車体の向き θ = atan2(前輪位置 - 後輪位置)
+            dx = front_total_x - rear_total_x
+            dy = front_total_y - rear_total_y
             
-            # 車体の移動距離 = 後輪の移動距離（車体中心の移動とほぼ同じ）
-            # ミッキー -> メートル に変換
-            distance_m = rear_dist / mickey_per_meter
-            total_distance += distance_m
-            
-            # ステアリング角度の計算
-            # 前後輪の移動差からヨーレート（角速度）を推定し、ステアリング角度を逆算
-            # 
-            # アッカーマンステアリングの関係:
-            # 前輪と後輪の軌跡差 = wheelbase * sin(heading_change)
-            # heading_change ≈ arc_diff / wheelbase (小角度近似)
-            #
-            # より厳密には:
-            # steering_angle = atan2(wheelbase * yaw_rate, velocity)
-            # yaw_rate ≈ (front_dist - rear_dist) / wheelbase
-            
-            if rear_dist > 0.01:  # ゼロ除算回避
-                # 前後輪の速度差からヨーレートを推定
-                yaw_rate_approx = (front_dist - rear_dist) / wheelbase_mickey
-                
-                # ステアリング角度 (ラジアン)
-                # tan(steering) ≈ wheelbase * yaw_rate / velocity
-                # ここでは簡略化: steering ≈ atan(yaw_rate * wheelbase / rear_dist)
-                steering_rad = math.atan2(yaw_rate_approx * wheelbase_mickey, rear_dist)
+            if abs(dx) > 0.001 or abs(dy) > 0.001:
+                current_theta = math.atan2(dy, dx)
             else:
-                steering_rad = 0.0
+                current_theta = initial_theta
             
-            # 度に変換
-            steering_deg = math.degrees(steering_rad)
+            # 車体の移動距離（後輪の移動量）
+            if i > 0:
+                prev_rear_x = rx0 + rear_mickey[i-1][3] / mickey_per_meter
+                prev_rear_y = ry0 + rear_mickey[i-1][4] / mickey_per_meter
+                # current rear pos
+                curr_rx = rx0 + rear_mickey[i][3] / mickey_per_meter
+                curr_ry = ry0 + rear_mickey[i][4] / mickey_per_meter
+                
+                distance_step = math.sqrt((curr_rx - prev_rear_x)**2 + (curr_ry - prev_rear_y)**2)
+            else:
+                distance_step = 0.0
+            
+            total_distance += distance_step
+            
+            # Rotation: 初期向きからの差分を計算（累積回転）
+            # atan2の不連続性を考慮する必要があるが、単純差分で可視化するには十分か？
+            # ここではシンプルに角度差を出す
+            theta_diff = current_theta - initial_theta
+            # Normalize to -pi to pi? Or keep accumulated?
+            # ユーザーの要望は「車体の回転」。累積回転の方が分かりやすい場合も。
+            # しかしatan2は -pi~pi なので、unwrapしないとジャンプする。
+            # 今回はシンプルに current_theta - initial_theta を度数法で出力
+            
+            # Wrap to -180 to 180 for standard heading deviation
+            while theta_diff > math.pi: theta_diff -= 2*math.pi
+            while theta_diff <= -math.pi: theta_diff += 2*math.pi
+            
+            rotation_deg = math.degrees(theta_diff)
             
             kinematics_data.append([
                 timestamp,
-                round(distance_m * 1000, 3),  # 移動距離 (mm)
-                round(total_distance * 1000, 1),  # 累計移動距離 (mm)
-                round(steering_deg, 2)  # ステアリング角度 (度)
+                round(distance_step * 1000, 3),   # Distance_mm
+                round(total_distance * 1000, 1),  # Total_Distance_mm
+                round(rotation_deg, 2)            # Rotation_deg
             ])
         
         # CSVに保存
         kinematics_path = os.path.join(run_dir, "mickey_kinematics.csv")
         with open(kinematics_path, "w") as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp_s", "Distance_mm", "Total_Distance_mm", "Steering_deg"])
+            writer.writerow(["Timestamp_s", "Distance_mm", "Total_Distance_mm", "Rotation_deg"])
             writer.writerows(kinematics_data)
         self.get_logger().info(f"Saved Vehicle Kinematics: {kinematics_path}")
 
