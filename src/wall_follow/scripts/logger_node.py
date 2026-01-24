@@ -407,13 +407,16 @@ class TrajectoryLogger(Node):
         return dr_path
     
     def generate_lidar_points_from_dr(self, images_dir, dr_path):
-        """DR経路を使ってLIDAR点群を生成・可視化"""
+        """DR経路を使ってLIDAR点群を可視化（0.07m以内の点は線でつなぐ）"""
         if len(self.scan_history) < 2 or not dr_path:
             self.get_logger().warn("Not enough data for LIDAR points")
             return
         
-        all_points = []
+        all_segments = []
         start_time = self.history[0][0] if self.history else 0
+        
+        # 線分接続の閾値（ユーザー指定: 4m * sin(1deg) approx 0.07m）
+        connect_threshold = 0.07
         
         for scan_entry in self.scan_history:
             scan_time, ranges, angle_min, angle_max, angle_inc = scan_entry
@@ -421,7 +424,17 @@ class TrajectoryLogger(Node):
             # 最も近い時刻のポーズを見つける
             closest_pose = None
             min_diff = float('inf')
+            # 単純な線形探索だと遅いので、前回のインデックスから探すなどの工夫が可能だが
+            # ここではデータ量がそれほどでもないのでループで処理
             for pose in dr_path:
+                # pose[0] is timestamp relative to start? or absolute?
+                # dr_path generation code uses `timestamp` directly from mickey data
+                # mickey data timestamp is `t` (relative?) -> No, it's relative in generate_mickey_data `while t <= end_time`.
+                # Wait, scan_time is absolute (nanoseconds/1e9).
+                # dr_path timestamp needs to be aligned. 
+                # In calculate_dead_reckoning_path, timestamp comes from rear_mickey[i][0] which is RELATIVE `round(t, 4)`.
+                # So we need to compare `scan_time - start_time` with `pose[0]`.
+                
                 diff = abs(pose[0] - (scan_time - start_time))
                 if diff < min_diff:
                     min_diff = diff
@@ -432,42 +445,72 @@ class TrajectoryLogger(Node):
             
             _, x, y, theta = closest_pose
             
-            # LiDARの取り付けオフセット (base_link aka Rear Axle からの距離)
+            # LiDARの取り付けオフセット
             lidar_offset = 0.275
             sensor_x = x + lidar_offset * math.cos(theta)
             sensor_y = y + lidar_offset * math.sin(theta)
             
+            # このスキャンの有効な点を全てワールド座標に変換
+            scan_points = []
             for i, r in enumerate(ranges):
+                # 有効範囲チェック
                 if r < 0.1 or r > 10.0 or math.isnan(r) or math.isinf(r):
-                    continue
+                    scan_points.append(None) # 無効な点
+                else:
+                    angle = angle_min + i * angle_inc
+                    wx = sensor_x + r * math.cos(theta + angle)
+                    wy = sensor_y + r * math.sin(theta + angle)
+                    scan_points.append((wx, wy))
+            
+            # 隣接点をつなぐ
+            for i in range(len(scan_points) - 1):
+                p1 = scan_points[i]
+                p2 = scan_points[i+1]
                 
-                angle = angle_min + i * angle_inc
-                # センサー位置を基準に座標変換
-                wx = sensor_x + r * math.cos(theta + angle)
-                wy = sensor_y + r * math.sin(theta + angle)
-                all_points.append((wx, wy))
-        
-        if not all_points:
-            self.get_logger().warn("No valid LIDAR points generated")
+                if p1 is not None and p2 is not None:
+                    dist = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+                    if dist <= connect_threshold:
+                        all_segments.append([p1, p2])
+
+        if not all_segments:
+            self.get_logger().warn("No valid LIDAR segments generated")
             return
         
+        # プロット作成
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
         
         fig, ax = plt.subplots(figsize=(12, 8))
-        sample_step = max(1, len(all_points) // 50000)
-        sampled = all_points[::sample_step]
-        xs = [p[0] for p in sampled]
-        ys = [p[1] for p in sampled]
         
-        ax.scatter(xs, ys, s=0.5, alpha=0.5, c='blue')
+        # LineCollectionで高速描画
+        lc = LineCollection(all_segments, colors='blue', linewidths=0.5, alpha=0.5)
+        ax.add_collection(lc)
+        
+        # スケール調整用に全点を集める
+        all_x = []
+        all_y = []
+        # 全点は多すぎるので、セグメントの間引きサンプリングで範囲を決める
+        step = max(1, len(all_segments) // 1000)
+        for i in range(0, len(all_segments), step):
+            seg = all_segments[i]
+            all_x.append(seg[0][0])
+            all_x.append(seg[1][0])
+            all_y.append(seg[0][1])
+            all_y.append(seg[1][1])
+            
         if dr_path:
             ax.scatter([dr_path[0][1]], [dr_path[0][2]], c='green', s=100, marker='o', label='Start')
         
+        if all_x:
+            margin = 2.0
+            ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
+            ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+            
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
-        ax.set_title(f'LIDAR Points ({len(all_points)} points)')
+        ax.set_title(f'LIDAR Wall Map (Segs < {connect_threshold}m)')
         ax.set_aspect('equal')
         ax.legend()
         ax.grid(True, alpha=0.3)
