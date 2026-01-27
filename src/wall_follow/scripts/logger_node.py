@@ -382,65 +382,67 @@ class TrajectoryLogger(Node):
         self.scan_history = []
     
     def calculate_dead_reckoning_path(self, front_mickey, rear_mickey, mickey_per_meter):
-        """純粋なDead Reckoning：前後輪の相対位置から向きを計算
+        """Dead Reckoning：正規化済みミッキーデータからDRパスを生成
         
-        ユーザーの図解に基づく：
-        - 前輪と後輪のTotal位置から、車体の向き θ = atan2(front - rear) を計算
-        - 後輪の位置 = 初期位置 + 累積変位
-        - 車体向き = 前輪位置 - 後輪位置 の角度
+        ミッキーデータは既に正規化座標系（初期向き=0度）で記録されている。
+        
+        【重要】self.historyへの依存なし - 本番環境で動作可能
+        
+        座標系の定義：
+        - 原点 = 初期LIDAR位置（後輪から前方27.5cm）
+        - 初期方向 = 0度（後輪→前輪ベクトルの方向 = +X方向）
+        
+        アルゴリズム:
+        1. 後輪・前輪位置を計算
+        2. 車体向きを計算
+        3. LIDAR位置を計算（後輪から前方27.5cm）
+        4. 初期LIDAR位置が(0,0)になるようオフセット
         """
         if len(front_mickey) != len(rear_mickey) or len(rear_mickey) < 2:
             return []
 
-        # 初期位置（オドメトリから）
-        if len(self.history) > 0:
-            rx0, ry0 = self.history[0][1], self.history[0][2]
-            fx0, fy0 = self.history[0][3], self.history[0][4] # 前輪初期位置も取得
-        else:
-            rx0, ry0 = 0.0, 0.0
-            fx0, fy0 = self.wheelbase, 0.0 # デフォルト
-
+        lidar_offset = 0.275  # 後輪からLIDARまでの距離 [m]
         dr_path = []
 
         for i in range(len(rear_mickey)):
             timestamp = rear_mickey[i][0]
             
-            # 前輪と後輪の累積変位（ワールド座標系、mm単位）
-            front_total_x = front_mickey[i][3] / mickey_per_meter  # meters
-            front_total_y = front_mickey[i][4] / mickey_per_meter
-            rear_total_x = rear_mickey[i][3] / mickey_per_meter
-            rear_total_y = rear_mickey[i][4] / mickey_per_meter
+            # 正規化された累積値（Total_X, Total_Y）をメートルに変換
+            rear_x = rear_mickey[i][3] / mickey_per_meter
+            rear_y = rear_mickey[i][4] / mickey_per_meter
+            front_x = front_mickey[i][3] / mickey_per_meter + self.wheelbase
+            front_y = front_mickey[i][4] / mickey_per_meter
             
-            # 現在位置（初期位置 + 累積変位）
-            # 注意: ここでのtotal_x/yは「ワールド座標系での累積移動量」
-            current_x = rx0 + rear_total_x
-            current_y = ry0 + rear_total_y
-            
-            # 前輪の現在位置
-            front_x = fx0 + front_total_x # rx0ではなくfx0を使用
-            front_y = fy0 + front_total_y
-            
-            # 車体の向き = 後輪から前輪への方向
-            dx = front_x - current_x
-            dy = front_y - current_y
-            
+            # 車体の向きを計算（後輪→前輪ベクトル）
+            dx = front_x - rear_x
+            dy = front_y - rear_y
             if abs(dx) > 0.0001 or abs(dy) > 0.0001:
-                current_theta = math.atan2(dy, dx)
+                theta = math.atan2(dy, dx)
             else:
-                current_theta = math.atan2(fy0 - ry0, fx0 - rx0) if len(self.history) > 0 else 0.0
+                theta = 0.0
             
-            dr_path.append([timestamp, current_x, current_y, current_theta])
+            # LIDAR位置を計算（後輪から前方27.5cm）
+            # 初期時（t=0）: rear=(0,0), theta=0 → lidar=(0.275, 0)
+            # 原点をLIDAR初期位置にするため -0.275 オフセット
+            lidar_x = rear_x + lidar_offset * math.cos(theta) - lidar_offset
+            lidar_y = rear_y + lidar_offset * math.sin(theta)
+            
+            dr_path.append([timestamp, lidar_x, lidar_y, theta])
 
         return dr_path
     
     def generate_lidar_points_from_dr(self, images_dir, dr_path):
-        """DR経路を使ってLIDAR点群を可視化（0.07m以内の点は線でつなぐ）"""
+        """DR経路を使ってLIDAR点群を可視化（0.07m以内の点は線でつなぐ）
+        
+        【重要】self.historyへの依存なし - 本番環境で動作可能
+        """
         if len(self.scan_history) < 2 or not dr_path:
             self.get_logger().warn("Not enough data for LIDAR points")
             return
         
         all_segments = []
-        start_time = self.history[0][0] if self.history else 0
+        # 開始時刻はスキャン履歴の最初のタイムスタンプから取得（self.history不要）
+        start_time = self.scan_history[0][0] if self.scan_history else 0
         
         # 線分接続の閾値（ユーザー指定: 4m * sin(1deg) approx 0.07m）
         connect_threshold = 0.07
@@ -472,10 +474,9 @@ class TrajectoryLogger(Node):
             
             _, x, y, theta = closest_pose
             
-            # LiDARの取り付けオフセット
-            lidar_offset = 0.275
-            sensor_x = x + lidar_offset * math.cos(theta)
-            sensor_y = y + lidar_offset * math.sin(theta)
+            # DRパスは既にLIDAR位置を出力しているので、追加オフセット不要
+            sensor_x = x
+            sensor_y = y
             
             # このスキャンの有効な点を全てワールド座標に変換
             scan_points = []
@@ -552,15 +553,25 @@ class TrajectoryLogger(Node):
         
         500Hz (2msごと) でサンプリングしたデータを生成。
         
-        ワールド座標系での変位を記録：
-        - X: ワールドX方向の変位
-        - Y: ワールドY方向の変位
+        正規化座標系での変位を記録（初期位置=原点、初期向き=0度）：
+        - ワールド座標変位を初期向きで回転して正規化
+        - Total_X, Total_Yは正規化座標系での累積値
+        
+        【シミュレーション用】self.historyから初期向きを取得して正規化
+        【本番環境】マウスセンサーが直接ローカル座標を出力するため、この変換は不要
         """
         if len(self.history) < 2:
             self.get_logger().warn("Not enough data to generate mickey data")
             return [], []
         
         start_time = self.history[0][0]
+        
+        # 初期向きを取得して正規化用の回転行列を準備
+        rx0, ry0 = self.history[0][1], self.history[0][2]
+        fx0, fy0 = self.history[0][3], self.history[0][4]
+        initial_theta = math.atan2(fy0 - ry0, fx0 - rx0)
+        cos_init = math.cos(-initial_theta)
+        sin_init = math.sin(-initial_theta)
         
         def interpolate_position(t, history, idx_x, idx_y):
             for i in range(len(history) - 1):
@@ -579,26 +590,26 @@ class TrajectoryLogger(Node):
         dt = 0.002  # 500Hz
         mickey_per_meter = 1000
         
-        # 前輪ミッキーデータ（ワールド座標系）
+        # 前輪ミッキーデータ（正規化座標系）
         front_mickey = []
         prev_fx, prev_fy = interpolate_position(0, self.history, 3, 4)
-        # float値で累積（精度を保持）
         total_fx_float, total_fy_float = 0.0, 0.0
         
         t = 0.0
         while t <= end_time:
             fx, fy = interpolate_position(t, self.history, 3, 4)
             
+            # ワールド座標変位を正規化座標に変換
             dx_world = fx - prev_fx
             dy_world = fy - prev_fy
+            dx_norm = dx_world * cos_init - dy_world * sin_init
+            dy_norm = dx_world * sin_init + dy_world * cos_init
             
-            # float値で累積してから、int変換
-            rel_x_float = dx_world * mickey_per_meter
-            rel_y_float = dy_world * mickey_per_meter
+            rel_x_float = dx_norm * mickey_per_meter
+            rel_y_float = dy_norm * mickey_per_meter
             total_fx_float += rel_x_float
             total_fy_float += rel_y_float
             
-            # 出力用にint変換
             rel_x = int(round(rel_x_float))
             rel_y = int(round(rel_y_float))
             total_fx = int(round(total_fx_float))
@@ -608,26 +619,26 @@ class TrajectoryLogger(Node):
             prev_fx, prev_fy = fx, fy
             t += dt
         
-        # 後輪ミッキーデータ（ワールド座標系）
+        # 後輪ミッキーデータ（正規化座標系）
         rear_mickey = []
         prev_rx, prev_ry = interpolate_position(0, self.history, 1, 2)
-        # float値で累積（精度を保持）
         total_rx_float, total_ry_float = 0.0, 0.0
         
         t = 0.0
         while t <= end_time:
             rx, ry = interpolate_position(t, self.history, 1, 2)
             
+            # ワールド座標変位を正規化座標に変換
             dx_world = rx - prev_rx
             dy_world = ry - prev_ry
+            dx_norm = dx_world * cos_init - dy_world * sin_init
+            dy_norm = dx_world * sin_init + dy_world * cos_init
             
-            # float値で累積してから、int変換
-            rel_x_float = dx_world * mickey_per_meter
-            rel_y_float = dy_world * mickey_per_meter
+            rel_x_float = dx_norm * mickey_per_meter
+            rel_y_float = dy_norm * mickey_per_meter
             total_rx_float += rel_x_float
             total_ry_float += rel_y_float
             
-            # 出力用にint変換
             rel_x = int(round(rel_x_float))
             rel_y = int(round(rel_y_float))
             total_rx = int(round(total_rx_float))
