@@ -248,6 +248,33 @@ class TrajectoryLogger(Node):
         front_mickey = []
         rear_mickey = []
         mickey_per_meter = 1000
+        
+        # --- 初期位置の保存 ---
+        if len(self.history) > 0:
+            init_pose_path = os.path.join(run_dir, "initial_pose.yaml")
+            try:
+                # self.history[0] = [timestamp, rx, ry, fx, fy, speed]
+                # yawは後輪→前輪ベクトルから計算
+                rx0, ry0 = self.history[0][1], self.history[0][2]
+                fx0, fy0 = self.history[0][3], self.history[0][4]
+                initial_yaw = math.atan2(fy0 - ry0, fx0 - rx0)
+                
+                init_data = {
+                    "timestamp": float(self.history[0][0]),
+                    "rx": float(rx0),
+                    "ry": float(ry0),
+                    "fx": float(fx0),
+                    "fy": float(fy0),
+                    "yaw_rad": float(initial_yaw),
+                    "yaw_deg": float(math.degrees(initial_yaw)),
+                }
+                
+                with open(init_pose_path, "w") as f:
+                    yaml.dump(init_data, f)
+                self.get_logger().info(f"Saved initial pose: {init_pose_path}")
+            except Exception as e:
+                self.get_logger().error(f"Failed to save initial pose: {e}")
+        # ----------------------
         try:
             front_mickey, rear_mickey = self.generate_mickey_data(mickey_dir)
         except Exception as e:
