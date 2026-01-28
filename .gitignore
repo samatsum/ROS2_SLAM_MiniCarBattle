@@ -3,16 +3,35 @@ build/
 install/
 log/
 .colcon/
+.ament/
 
 # Python
 __pycache__/
 *.py[cod]
 *.so
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+env/
+.venv/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints
 
 # IDEs
 .vscode/
 .idea/
 *.swp
+*.swo
 
 # System
 .DS_Store
+Thumbs.db
+
+# Private files
+メモ
+*.bag
+*.mcap
+*.db3

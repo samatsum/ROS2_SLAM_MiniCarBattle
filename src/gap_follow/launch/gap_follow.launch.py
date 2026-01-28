@@ -12,8 +12,8 @@ def generate_launch_description():
 
     # 1. 軌跡ロガーノード
     logger_node = Node(
-        package="wall_follow",
-        executable="logger_node.py",
+        package="gap_follow",
+        executable="data_logger.py",
         name="trajectory_logger",
         output="screen",
         parameters=[
@@ -25,11 +25,11 @@ def generate_launch_description():
         ],
     )
 
-    # 2. 走行ノード (Wall Follow)
-    wall_follow_node = Node(
-        package="wall_follow",
-        executable="wall_follow_node",
-        name="wall_follow_node",
+    # 2. 走行ノード (Gap Follow)
+    gap_follow_node = Node(
+        package="gap_follow",
+        executable="reactive_node",
+        name="reactive_node",
         output="screen",
         parameters=[
             {"velocity": 2.5},
@@ -40,7 +40,7 @@ def generate_launch_description():
 
     # 3. リセット管理ノード (Sim Reset)
     sim_reset_node = Node(
-        package="wall_follow",
+        package="gap_follow",
         executable="sim_reset_node",
         name="sim_reset_node",
         output="screen",
@@ -60,7 +60,7 @@ def generate_launch_description():
             spawn_y_arg,
             spawn_theta_arg,
             logger_node,      # 1. ログ記録
-            wall_follow_node, # 2. 車を動かす
+            gap_follow_node,  # 2. 車を動かす
             sim_reset_node,   # 3. リセット管理
         ]
     )
