@@ -155,3 +155,6 @@ LIDARのビームは一定の角度（約1度）で広がっているため、�
 
 これね、計算に使用したサイト・。
 https://ja.numberempire.com/isosceles_triangle_calculator.php
+
+あと、4mに設定した理由は単純に以前他の参加者が4mまでしか安物LIDARは信用できないみたいなこと言ってた記憶が有るから。
+
