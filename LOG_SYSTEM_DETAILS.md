@@ -153,3 +153,5 @@ LIDARのビームは一定の角度（約1度）で広がっているため、�
 
 このLIDARデータと、先ほどのDR計算で求めた「車の位置」を組み合わせることで、**「どの場所に壁があったか」** を地図上にプロット (`mickey_lidar_points.png`) することができます。
 
+これね、計算に使用したサイト・。
+https://ja.numberempire.com/isosceles_triangle_calculator.php
