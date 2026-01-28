@@ -344,20 +344,40 @@ class TrajectoryLogger(Node):
                         f2 = to_pix(self.history[i + 1][3], self.history[i + 1][4])
                         draw_kin.line([f1, f2], fill=(255, 150, 150), width=1)
                     
-                    # DR経路を描画（シアン色）
+                    # DRパスをワールド座標に変換するための初期位置・初期向き
+                    if len(self.history) > 0:
+                        init_rx, init_ry = self.history[0][1], self.history[0][2]
+                        init_fx, init_fy = self.history[0][3], self.history[0][4]
+                        init_theta = math.atan2(init_fy - init_ry, init_fx - init_rx)
+                        cos_init = math.cos(init_theta)
+                        sin_init = math.sin(init_theta)
+                    else:
+                        init_rx, init_ry = 0.0, 0.0
+                        cos_init, sin_init = 1.0, 0.0
+                    
+                    def dr_to_world(dr_x, dr_y):
+                        """正規化座標 → ワールド座標"""
+                        world_x = dr_x * cos_init - dr_y * sin_init + init_rx
+                        world_y = dr_x * sin_init + dr_y * cos_init + init_ry
+                        return world_x, world_y
+                    
+                    # DR経路を描画（シアン色）- ワールド座標に変換
                     step = max(1, len(dr_path) // 5000)
                     for i in range(0, len(dr_path) - step, step):
                         p1 = dr_path[i]
                         p2 = dr_path[min(i + step, len(dr_path) - 1)]
-                        px1, py1 = to_pix(p1[1], p1[2])
-                        px2, py2 = to_pix(p2[1], p2[2])
+                        w1_x, w1_y = dr_to_world(p1[1], p1[2])
+                        w2_x, w2_y = dr_to_world(p2[1], p2[2])
+                        px1, py1 = to_pix(w1_x, w1_y)
+                        px2, py2 = to_pix(w2_x, w2_y)
                         draw_kin.line([(px1, py1), (px2, py2)], fill=(0, 255, 255), width=3)
                     
                     # 開始点（緑）と終了点（マゼンタ）
                     if len(self.history) > 0:
                         draw_kin.ellipse([px_pos - 12, py_pos - 12, px_pos + 12, py_pos + 12], fill=(0, 255, 0), outline=(0, 180, 0))
                     if dr_path:
-                        end_px, end_py = to_pix(dr_path[-1][1], dr_path[-1][2])
+                        end_w_x, end_w_y = dr_to_world(dr_path[-1][1], dr_path[-1][2])
+                        end_px, end_py = to_pix(end_w_x, end_w_y)
                         draw_kin.ellipse([end_px - 10, end_py - 10, end_px + 10, end_py + 10], fill=(255, 0, 255), outline=(180, 0, 180))
                     
                     kin_path = os.path.join(images_dir, "kinematics.png")
@@ -389,45 +409,64 @@ class TrajectoryLogger(Node):
         【重要】self.historyへの依存なし - 本番環境で動作可能
         
         座標系の定義：
-        - 原点 = 初期LIDAR位置（後輪から前方27.5cm）
+        - 原点 = 初期後輪位置 (0, 0)
         - 初期方向 = 0度（後輪→前輪ベクトルの方向 = +X方向）
         
-        アルゴリズム:
-        1. 後輪・前輪位置を計算
-        2. 車体向きを計算
-        3. LIDAR位置を計算（後輪から前方27.5cm）
-        4. 初期LIDAR位置が(0,0)になるようオフセット
+        改善点：
+        - 浮動小数点Total値（列5,6）を使用して丸め誤差を排除
+        - 角速度積分方式でtheta計算
+        - ループ最適化：逆数の事前計算、前回値の保持
         """
         if len(front_mickey) != len(rear_mickey) or len(rear_mickey) < 2:
             return []
 
-        lidar_offset = 0.275  # 後輪からLIDARまでの距離 [m]
         dr_path = []
+        theta = 0.0  # 初期向きは0度
+        
+        # 最適化：逆数を事前計算（割り算→掛け算）
+        inv_mpm = 1.0 / mickey_per_meter
+        inv_wb = 1.0 / self.wheelbase
+        
+        # 初期値を計算
+        prev_rear_x = rear_mickey[0][5] * inv_mpm
+        prev_rear_y = rear_mickey[0][6] * inv_mpm
+        prev_front_x = front_mickey[0][5] * inv_mpm + self.wheelbase
+        prev_front_y = front_mickey[0][6] * inv_mpm
 
         for i in range(len(rear_mickey)):
             timestamp = rear_mickey[i][0]
             
-            # 正規化された累積値（Total_X, Total_Y）をメートルに変換
-            rear_x = rear_mickey[i][3] / mickey_per_meter
-            rear_y = rear_mickey[i][4] / mickey_per_meter
-            front_x = front_mickey[i][3] / mickey_per_meter + self.wheelbase
-            front_y = front_mickey[i][4] / mickey_per_meter
+            # 浮動小数点Total値を使用（掛け算で高速化）
+            rear_x = rear_mickey[i][5] * inv_mpm
+            rear_y = rear_mickey[i][6] * inv_mpm
+            front_x = front_mickey[i][5] * inv_mpm + self.wheelbase
+            front_y = front_mickey[i][6] * inv_mpm
             
-            # 車体の向きを計算（後輪→前輪ベクトル）
-            dx = front_x - rear_x
-            dy = front_y - rear_y
-            if abs(dx) > 0.0001 or abs(dy) > 0.0001:
-                theta = math.atan2(dy, dx)
-            else:
-                theta = 0.0
+            if i > 0:
+                # 前回との差分（変位）を計算
+                rear_dx = rear_x - prev_rear_x
+                rear_dy = rear_y - prev_rear_y
+                front_dx = front_x - prev_front_x
+                front_dy = front_y - prev_front_y
+                
+                # 角速度積分方式でtheta計算
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                
+                # 横方向変位を計算
+                rear_lateral = -rear_dx * sin_t + rear_dy * cos_t
+                front_lateral = -front_dx * sin_t + front_dy * cos_t
+                
+                # 角速度 = (前輪横変位 - 後輪横変位) / ホイールベース
+                dtheta = (front_lateral - rear_lateral) * inv_wb
+                theta += dtheta
             
-            # LIDAR位置を計算（後輪から前方27.5cm）
-            # 初期時（t=0）: rear=(0,0), theta=0 → lidar=(0.275, 0)
-            # 原点をLIDAR初期位置にするため -0.275 オフセット
-            lidar_x = rear_x + lidar_offset * math.cos(theta) - lidar_offset
-            lidar_y = rear_y + lidar_offset * math.sin(theta)
+            # 前回値を更新（次のループで使用）
+            prev_rear_x, prev_rear_y = rear_x, rear_y
+            prev_front_x, prev_front_y = front_x, front_y
             
-            dr_path.append([timestamp, lidar_x, lidar_y, theta])
+            # 後輪位置を出力
+            dr_path.append([timestamp, rear_x, rear_y, theta])
 
         return dr_path
     
@@ -474,31 +513,35 @@ class TrajectoryLogger(Node):
             
             _, x, y, theta = closest_pose
             
-            # DRパスは既にLIDAR位置を出力しているので、追加オフセット不要
-            sensor_x = x
-            sensor_y = y
+            # DRパスは後輪位置を出力しているので、LIDARオフセットを適用
+            lidar_offset = 0.275
+            sensor_x = x + lidar_offset * math.cos(theta)
+            sensor_y = y + lidar_offset * math.sin(theta)
             
-            # このスキャンの有効な点を全てワールド座標に変換
-            scan_points = []
-            for i, r in enumerate(ranges):
-                # 有効範囲チェック
-                if r < 0.1 or r > 10.0 or math.isnan(r) or math.isinf(r):
-                    scan_points.append(None) # 無効な点
-                else:
-                    angle = angle_min + i * angle_inc
-                    wx = sensor_x + r * math.cos(theta + angle)
-                    wy = sensor_y + r * math.sin(theta + angle)
-                    scan_points.append((wx, wy))
+            # NumPyベクトル化：このスキャンの全点を一括でワールド座標に変換
+            ranges_arr = np.array(ranges)
+            n_points = len(ranges)
             
-            # 隣接点をつなぐ
-            for i in range(len(scan_points) - 1):
-                p1 = scan_points[i]
-                p2 = scan_points[i+1]
-                
-                if p1 is not None and p2 is not None:
-                    dist = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+            # 角度配列を生成
+            angles = angle_min + np.arange(n_points) * angle_inc
+            
+            # 有効な点のマスク
+            valid_mask = (ranges_arr >= 0.1) & (ranges_arr <= 10.0) & np.isfinite(ranges_arr)
+            
+            # ワールド座標を一括計算
+            world_angles = theta + angles
+            wx_all = sensor_x + ranges_arr * np.cos(world_angles)
+            wy_all = sensor_y + ranges_arr * np.sin(world_angles)
+            
+            # 隣接点をつなぐセグメントを生成（ベクトル化）
+            # 両方の点が有効で、距離が閾値以下の場合のみ接続
+            for i in range(n_points - 1):
+                if valid_mask[i] and valid_mask[i + 1]:
+                    dx = wx_all[i + 1] - wx_all[i]
+                    dy = wy_all[i + 1] - wy_all[i]
+                    dist = math.sqrt(dx * dx + dy * dy)
                     if dist <= connect_threshold:
-                        all_segments.append([p1, p2])
+                        all_segments.append([(wx_all[i], wy_all[i]), (wx_all[i + 1], wy_all[i + 1])])
 
         if not all_segments:
             self.get_logger().warn("No valid LIDAR segments generated")
@@ -615,7 +658,9 @@ class TrajectoryLogger(Node):
             total_fx = int(round(total_fx_float))
             total_fy = int(round(total_fy_float))
             
-            front_mickey.append([round(t, 4), rel_x, rel_y, total_fx, total_fy])
+            # 浮動小数点Total値を追加（精度向上のため）
+            front_mickey.append([round(t, 4), rel_x, rel_y, total_fx, total_fy, 
+                                round(total_fx_float, 4), round(total_fy_float, 4)])
             prev_fx, prev_fy = fx, fy
             t += dt
         
@@ -644,24 +689,26 @@ class TrajectoryLogger(Node):
             total_rx = int(round(total_rx_float))
             total_ry = int(round(total_ry_float))
             
-            rear_mickey.append([round(t, 4), rel_x, rel_y, total_rx, total_ry])
+            # 浮動小数点Total値を追加（精度向上のため）
+            rear_mickey.append([round(t, 4), rel_x, rel_y, total_rx, total_ry,
+                               round(total_rx_float, 4), round(total_ry_float, 4)])
             prev_rx, prev_ry = rx, ry
             t += dt
         
-        # CSVに保存
+        # CSVに保存（浮動小数点Total値を含む）
         front_mickey_path = os.path.join(run_dir, "mickey_front.csv")
         with open(front_mickey_path, "w") as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y"])
+            writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y", "Total_X_f", "Total_Y_f"])
             writer.writerows(front_mickey)
-        self.get_logger().info(f"Saved Front Mickey Data (World): {front_mickey_path}")
+        self.get_logger().info(f"Saved Front Mickey Data: {front_mickey_path}")
         
         rear_mickey_path = os.path.join(run_dir, "mickey_rear.csv")
         with open(rear_mickey_path, "w") as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y"])
+            writer.writerow(["Timestamp_s", "Rel_X", "Rel_Y", "Total_X", "Total_Y", "Total_X_f", "Total_Y_f"])
             writer.writerows(rear_mickey)
-        self.get_logger().info(f"Saved Rear Mickey Data (World): {rear_mickey_path}")
+        self.get_logger().info(f"Saved Rear Mickey Data: {rear_mickey_path}")
         
         self.calculate_vehicle_kinematics(run_dir, front_mickey, rear_mickey, mickey_per_meter)
         
