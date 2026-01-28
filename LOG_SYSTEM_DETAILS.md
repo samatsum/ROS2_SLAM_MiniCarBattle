@@ -139,8 +139,9 @@ LIDARのビームは一定の角度（約1度）で広がっているため、�
 
 ![Calculation 1](doc_images/lidar_threshold_calc_1.png)
 
+
 2.  **計算結果**:
-    *   計算サイトの結果より、底辺の長さ $b \approx 0.0698\text{m}$ となります。
+    *   計算サイト（[二等辺三角形の計算機](https://ja.numberempire.com/isosceles_triangle_calculator.php)）の結果より、底辺の長さ $b \approx 0.0698\text{m}$ となります。
     *   つまり、4m先にある壁の点同士は約 7cm 離れて計測されます。
 
 ![Calculation 2](doc_images/lidar_threshold_calc_2.png)
@@ -151,10 +152,7 @@ LIDARのビームは一定の角度（約1度）で広がっているため、�
 
 というロジックで、0.07m を閾値として採用しています。
 
+> **Note:**
+> 有効距離を **4m** に設定した理由は、安価なLIDARセンサーにおける信頼性の限界（経験則として4mを超えると精度が落ちるという知見）に基づいています。
+
 このLIDARデータと、先ほどのDR計算で求めた「車の位置」を組み合わせることで、**「どの場所に壁があったか」** を地図上にプロット (`mickey_lidar_points.png`) することができます。
-
-これね、計算に使用したサイト・。
-https://ja.numberempire.com/isosceles_triangle_calculator.php
-
-あと、4mに設定した理由は単純に以前他の参加者が4mまでしか安物LIDARは信用できないみたいなこと言ってた記憶が有るから。
-
