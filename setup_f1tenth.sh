@@ -38,6 +38,7 @@ fi
 # Your Autonomous Driving Code
 if [ ! -d "ROS2_SLAM_MiniCarBattle" ]; then
     git clone https://github.com/samatsum/ROS2_SLAM_MiniCarBattle.git
+else
     echo "  - ROS2_SLAM_MiniCarBattle already exists. Updating..."
     cd ROS2_SLAM_MiniCarBattle
     git pull
@@ -46,13 +47,15 @@ fi
 
 # Apply Config Overrides (Fix for map path issues on different usernames)
 echo "    -> Applying config overrides..."
-if [ -d "ROS2_SLAM_MiniCarBattle/config_overrides" ]; then
-    cp ROS2_SLAM_MiniCarBattle/config_overrides/gym_bridge_launch.py f1tenth_gym_ros/launch/
-    cp ROS2_SLAM_MiniCarBattle/config_overrides/sim.yaml f1tenth_gym_ros/config/
-    cp ROS2_SLAM_MiniCarBattle/config_overrides/CourseImage_Standard.* f1tenth_gym_ros/maps/
+OVERRIDES_DIR="ROS2_SLAM_MiniCarBattle/src/ROS2_SLAM_MiniCarBattle/config_overrides"
+
+if [ -d "$OVERRIDES_DIR" ]; then
+    cp -v $OVERRIDES_DIR/gym_bridge_launch.py f1tenth_gym_ros/launch/
+    cp -v $OVERRIDES_DIR/sim.yaml f1tenth_gym_ros/config/
+    cp -v $OVERRIDES_DIR/CourseImage_Standard.* f1tenth_gym_ros/maps/
     echo "    -> Overrides and maps applied successfully."
 else
-    echo "    -> No overrides found."
+    echo "    -> No overrides found at $OVERRIDES_DIR"
 fi
 
 # 5. Install Dependencies
