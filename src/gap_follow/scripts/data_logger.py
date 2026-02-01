@@ -29,6 +29,8 @@ class TrajectoryLogger(Node):
 
         # マップ設定 (YAMLファイルから自動読み込み)
         self.map_path = None
+        # フォールバック用のデフォルトパス
+        self.default_map_path = '/home/samatsum/f1tenth_ws/src/f1tenth_gym_ros/maps/CourseImage_Standard.png'
         self.map_settings = {
             "resolution": 0.01,
             "origin_x": 0.0,
@@ -36,6 +38,10 @@ class TrajectoryLogger(Node):
         }
         self.map_path_fetched = False
         self.param_client = None  # 遅延初期化
+        
+        # LIDAR処理パラメータ (sim.yamlから取得、デフォルト値付き)
+        self.lidar_connect_threshold = 0.1  # 隣接点の接続閾値 (m)
+        self.scan_distance_to_base_link = 0.275  # LIDARオフセット (m)
 
         # データバッファ
         self.history = []  # [timestamp, rx, ry, fx, fy, speed]
@@ -66,7 +72,7 @@ class TrajectoryLogger(Node):
         self.get_logger().info("Trajectory Logger Started. Press Ctrl+C to save and exit.")
     
     def fetch_map_path_once(self):
-        """gym_bridgeノードからmap_pathパラメータを取得 (1回だけ実行)"""
+        """gym_bridgeノードからmap_pathパラメータを取得 (取得できるまでリトライ)"""
         if self.map_path_fetched:
             return
         
@@ -76,36 +82,52 @@ class TrajectoryLogger(Node):
                 GetParameters, "/bridge/get_parameters"
             )
         
-        # ノンブロッキングでサービスの確認
+        # サービスが準備できていない場合はリトライ
         if not self.param_client.service_is_ready():
-            # サービスがまだ準備できていない場合は次のタイマーで再試行
+            self.get_logger().info("Waiting for /bridge/get_parameters service...")
             return
         
         request = GetParameters.Request()
-        request.names = ["map_path"]
+        request.names = ["map_path", "lidar_connect_threshold", "scan_distance_to_base_link"]
         
         future = self.param_client.call_async(request)
         future.add_done_callback(self.on_map_path_received)
-        self.map_path_fetched = True
-        self.get_logger().info("Fetching map_path from gym_bridge...")
+        self.get_logger().info("Requesting parameters from gym_bridge...")
     
     def on_map_path_received(self, future):
         """パラメータ取得完了時のコールバック"""
         try:
             result = future.result()
             if result.values:
+                # map_path
                 map_path_base = result.values[0].string_value
-                # gym_bridge は拡張子なしで保存しているので .png を追加
-                self.map_path = map_path_base + ".png"
-                self.get_logger().info(f"Map path from gym_bridge: {self.map_path}")
+                if map_path_base:
+                    # gym_bridge は拡張子なしで保存しているので .png を追加
+                    self.map_path = map_path_base + ".png"
+                    self.get_logger().info(f"Map path from gym_bridge: {self.map_path}")
+                    
+                    # 成功した場合のみ完了フラグを立てる
+                    self.map_path_fetched = True
+                    
+                    # マップのYAMLファイルから設定を読み込み
+                    yaml_path = map_path_base + ".yaml"
+                    self.load_map_settings(yaml_path)
+                else:
+                    self.get_logger().warn("Empty map_path received, will retry...")
+
+                # lidar_connect_threshold
+                if len(result.values) > 1 and result.values[1].double_value > 0:
+                    self.lidar_connect_threshold = result.values[1].double_value
+                    self.get_logger().info(f"Updated lidar_connect_threshold: {self.lidar_connect_threshold}")
                 
-                # マップのYAMLファイルから設定を読み込み
-                yaml_path = map_path_base + ".yaml"
-                self.load_map_settings(yaml_path)
+                # scan_distance_to_base_link
+                if len(result.values) > 2 and result.values[2].double_value > 0:
+                    self.scan_distance_to_base_link = result.values[2].double_value
+                    self.get_logger().info(f"Updated scan_distance_to_base_link: {self.scan_distance_to_base_link}")
             else:
-                self.get_logger().warn("Could not get map_path from bridge node")
+                self.get_logger().warn("Could not get map_path params from bridge node, will retry...")
         except Exception as e:
-            self.get_logger().error(f"Failed to get map_path: {e}")
+            self.get_logger().error(f"Failed to get map_path: {e}, will retry...")
     
     def load_map_settings(self, yaml_path):
         """マップのYAMLファイルから resolution と origin を読み込む"""
@@ -288,8 +310,13 @@ class TrajectoryLogger(Node):
         # 3. images/trajectory_map.png 画像生成
         try:
             map_path = self.map_path
+            map_path = self.map_path
             if not map_path:
-                self.get_logger().warn("Map path not yet fetched from gym_bridge. Skipping image generation.")
+                self.get_logger().warn("Map path not fetched from gym_bridge. Using default fallback.")
+                map_path = self.default_map_path
+            
+            if not map_path or not os.path.exists(map_path):
+                self.get_logger().warn(f"Map path invalid: {map_path}. Skipping image generation.")
             elif os.path.exists(map_path):
                 res = self.map_settings["resolution"]
                 org_x = self.map_settings["origin_x"]
@@ -483,8 +510,8 @@ class TrajectoryLogger(Node):
         # 開始時刻はスキャン履歴の最初のタイムスタンプから取得（self.history不要）
         start_time = self.scan_history[0][0] if self.scan_history else 0
         
-        # 線分接続の閾値（ユーザー指定: 4m * sin(1deg) approx 0.07m）
-        connect_threshold = 0.07
+        # 線分接続の閾値（sim.yamlから取得）
+        connect_threshold = self.lidar_connect_threshold
         
         for scan_entry in self.scan_history:
             scan_time, ranges, angle_min, angle_max, angle_inc = scan_entry
@@ -514,9 +541,8 @@ class TrajectoryLogger(Node):
             _, x, y, theta = closest_pose
             
             # DRパスは後輪位置を出力しているので、LIDARオフセットを適用
-            lidar_offset = 0.275
-            sensor_x = x + lidar_offset * math.cos(theta)
-            sensor_y = y + lidar_offset * math.sin(theta)
+            sensor_x = x + self.scan_distance_to_base_link * math.cos(theta)
+            sensor_y = y + self.scan_distance_to_base_link * math.sin(theta)
             
             # NumPyベクトル化：このスキャンの全点を一括でワールド座標に変換
             ranges_arr = np.array(ranges)
@@ -820,7 +846,7 @@ class TrajectoryLogger(Node):
         # スキャンのタイムスタンプに対応する位置を使用
         
         all_segments = []
-        distance_threshold = 0.07  # 線分抽出の閾値
+        distance_threshold = self.lidar_connect_threshold  # 線分抽出の閾値（sim.yamlから取得）
         
         for scan_data in self.scan_history:
             scan_time, ranges, angle_min, angle_max, angle_inc = scan_data
