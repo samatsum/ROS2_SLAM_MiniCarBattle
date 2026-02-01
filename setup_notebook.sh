@@ -43,7 +43,7 @@ sudo apt-get install -y \
 echo ""
 echo "[Step 3/6] Python依存関係をインストール中..."
 pip3 install transforms3d
-pip3 install numpy
+pip3 install "numpy>=1.22.4"
 pip3 install pyyaml
 pip3 install matplotlib
 pip3 install pandas
